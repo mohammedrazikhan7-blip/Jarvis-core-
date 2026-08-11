@@ -19,7 +19,10 @@ export default async function handler(req: any, res: any) {
         ? JSON.parse(req.body)
         : req.body || {};
 
-    const question = body.question || body.message || body.prompt;
+    const question =
+      body.question ||
+      body.message ||
+      body.prompt;
 
     if (!question || typeof question !== "string") {
       return res.status(400).json({
@@ -37,17 +40,19 @@ export default async function handler(req: any, res: any) {
         },
         body: JSON.stringify({
           model: "llama-3.3-70b-versatile",
+
           messages: [
             {
               role: "system",
               content:
-                "You are JARVIS, a friendly, intelligent and respectful AI assistant. Address the user respectfully. Understand English, Hindi and Hinglish and reply in the language the user uses. Keep spoken answers clear and natural unless the user asks for detail."
+                "You are JARVIS, the user's personal AI assistant. Be friendly, intelligent, calm, respectful and natural. Address the user as sir when appropriate. Understand English, Hindi and Hinglish and reply naturally in the same language the user uses. Keep spoken answers short and conversational. Be helpful, honest and clear."
             },
             {
               role: "user",
               content: question
             }
           ],
+
           temperature: 0.7,
           max_tokens: 1000
         })
@@ -74,6 +79,7 @@ export default async function handler(req: any, res: any) {
       response: answer,
       text: answer
     });
+
   } catch (error) {
     console.error("JARVIS API error:", error);
 
