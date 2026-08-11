@@ -6,6 +6,6 @@
     "next": "latest"
   },
   "scripts": {
-    "build": "echo Build complete"
+    "build": "next build"
   }
 }
