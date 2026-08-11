@@ -1,11 +1,5 @@
 {
   "name": "jarvis-backend",
   "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "next": "latest"
-  },
-  "scripts": {
-    "build": "echo Build complete"
-  }
+  "private": true
 }
