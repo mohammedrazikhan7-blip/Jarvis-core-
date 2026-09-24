@@ -193,7 +193,39 @@ ${memories.map((m: any) =>
     const answer =
       data?.choices?.[0]?.message?.content ||
       "Sorry, I could not generate a response.";
-
+    
+await sql`
+  INSERT INTO jarvis_memory (
+    user_id,
+    memory_type,
+    memory_key,
+    memory_value,
+    importance
+  )
+  VALUES (
+    'razi',
+    'conversation',
+    'latest_question',
+    ${question},
+    5
+  )
+`;
+    await sql`
+  INSERT INTO jarvis_memory (
+    user_id,
+    memory_type,
+    memory_key,
+    memory_value,
+    importance
+  )
+  VALUES (
+    'razi',
+    'conversation',
+    'latest_answer',
+    ${answer},
+    5
+  )
+`;
     return res.status(200).json({
       answer: answer,
       response: answer,
