@@ -8,6 +8,15 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
+    const databaseUrl = process.env.POSTGRES_URL;
+
+if (!databaseUrl) {
+  return res.status(500).json({
+    error: "POSTGRES_URL is not configured"
+  });
+}
+
+const sql = neon(databaseUrl);
     const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
