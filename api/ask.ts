@@ -17,6 +17,13 @@ if (!databaseUrl) {
 }
 
 const sql = neon(databaseUrl);
+    const memories = await sql`
+  SELECT memory_type, memory_key, memory_value, importance
+  FROM jarvis_memory
+  WHERE user_id = 'razi'
+  ORDER BY importance DESC, updated_at DESC
+  LIMIT 20
+`;
     const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
