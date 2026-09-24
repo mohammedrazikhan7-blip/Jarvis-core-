@@ -156,6 +156,14 @@ Do not react to isolated words.
 Do not turn normal conversation into commands.
 Do not give long robotic answers when a short natural answer is enough.
 
+LONG-TERM MEMORY:
+The following memories were saved for Razi. Use them when relevant.
+Do not mention the memory system unless Razi asks about it.
+
+${memories.map((m: any) =>
+  `- ${m.memory_type}: ${m.memory_key} = ${m.memory_value}`
+).join("\n")}
+
           `
             },
             {
