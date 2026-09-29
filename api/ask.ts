@@ -59,7 +59,7 @@ export default async function handler(req: any, res: any) {
         },
 
         body: JSON.stringify({
-          model: "llama-3.1-8b-instant",
+          model: "openai/gpt-oss-20b",
 
           messages: [
             {
@@ -250,4 +250,4 @@ ${memories.map((m: any) =>
       error: "Internal server error"
     });
   }
-  }
+}
