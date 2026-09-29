@@ -10,13 +10,13 @@ export default async function handler(req: any, res: any) {
   try {
     const databaseUrl = process.env.POSTGRES_URL;
 
-if (!databaseUrl) {
-  return res.status(500).json({
-    error: "POSTGRES_URL is not configured"
-  });
-}
+    if (!databaseUrl) {
+      return res.status(500).json({
+        error: "POSTGRES_URL is not configured"
+      });
+    }
 
-const sql = neon(databaseUrl);
+    const sql = neon(databaseUrl);
     const memories = await sql`
   SELECT memory_type, memory_key, memory_value, importance
   FROM jarvis_memory
@@ -59,7 +59,7 @@ const sql = neon(databaseUrl);
         },
 
         body: JSON.stringify({
-  model: "openai/gpt-oss-20b",
+          model: "llama-3.1-8b-instant",
 
           messages: [
             {
@@ -152,6 +152,7 @@ RESPONSE STYLE:
 - Avoid repeating information Razi already knows.
 - For simple questions, give a simple answer.
 - For complex questions, explain clearly but still conversationally.
+- Never start a reply with filler words like "Sure thing", "Sure", "Okay so", "Well". Go straight to the answer.
 
 CREATOR IDENTITY:
 - Your name is JARVIS.
@@ -204,7 +205,7 @@ ${memories.map((m: any) =>
       data?.choices?.[0]?.message?.content ||
       "Sorry, I could not generate a response.";
     
-await sql`
+    await sql`
   INSERT INTO jarvis_memory (
     user_id,
     memory_type,
@@ -249,4 +250,4 @@ await sql`
       error: "Internal server error"
     });
   }
-}
+  }
