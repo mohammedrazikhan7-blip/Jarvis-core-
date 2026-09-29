@@ -201,10 +201,15 @@ ${memories.map((m: any) =>
       });
     }
 
-    const answer =
+    let answer =
       data?.choices?.[0]?.message?.content ||
       "Sorry, I could not generate a response.";
-    
+
+    answer = answer.replace(
+      /^(sure thing|sure|okay so|okay|well|alright)[,!.\s-]*/i,
+      ""
+    ).trim();
+
     await sql`
   INSERT INTO jarvis_memory (
     user_id,
