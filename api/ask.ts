@@ -17,13 +17,9 @@ export default async function handler(req: any, res: any) {
     }
 
     const sql = neon(databaseUrl);
-    const memories = await sql`
-  SELECT memory_type, memory_key, memory_value, importance
-  FROM jarvis_memory
-  WHERE user_id = 'razi'
-  ORDER BY importance DESC, updated_at DESC
-  LIMIT 20
-`;
+
+    let memories: any[] = [];
+
     const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
@@ -47,6 +43,42 @@ export default async function handler(req: any, res: any) {
         error: "Question is required"
       });
     }
+
+    // ===== LONG-TERM MEMORY: find the memories that matter =====
+    const stop = new Set(["what","when","where","which","this","that","there","about","with","from","have","does","your","tell","please","jarvis","remember","important","would","could","should","will","then","than","into","been","just","like","know","kya","hai","hain","mera","meri","mere","aur"]);
+    const words = Array.from(new Set(
+      question.toLowerCase().replace(/[^a-z0-9\u0900-\u097f\s]/g, " ").split(/\s+/)
+        .filter((w: string) => w.length >= 4 && !stop.has(w))
+    )).slice(0, 6);
+    const patterns = words.map((w: string) => `%${w}%`);
+
+    const important = await sql`
+      SELECT memory_value, updated_at AS day FROM jarvis_memory
+      WHERE user_id = 'razi' AND importance >= 9
+      ORDER BY updated_at DESC LIMIT 15`;
+
+    const related = patterns.length ? await sql`
+      SELECT memory_value, updated_at AS day FROM jarvis_memory
+      WHERE user_id = 'razi' AND importance < 9
+      AND memory_key NOT IN ('latest_question', 'latest_answer')
+      AND memory_value ILIKE ANY(${patterns}::text[])
+      ORDER BY updated_at DESC LIMIT 8` : [];
+
+    const recent = await sql`
+      SELECT memory_value, updated_at AS day FROM jarvis_memory
+      WHERE user_id = 'razi' AND memory_key = 'chat'
+      ORDER BY updated_at DESC LIMIT 3`;
+
+    const dayOf = (x: any) => new Date(x).toISOString().slice(0, 10);
+    const cut = (s: any) => String(s).slice(0, 300);
+
+    memories = [
+      { memory_type: "TODAY", memory_key: "date", memory_value: dayOf(new Date()) },
+      ...important.map((m: any) => ({ memory_type: "IMPORTANT, never forget", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) })),
+      ...related.map((m: any) => ({ memory_type: "old memory", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) })),
+      ...recent.reverse().map((m: any) => ({ memory_type: "recent chat", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) }))
+    ];
+    // ===== END LONG-TERM MEMORY SEARCH =====
 
     const groqResponse = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
@@ -169,6 +201,8 @@ Do not give long robotic answers when a short natural answer is enough.
 
 LONG-TERM MEMORY:
 The following memories were saved for Razi. Use them when relevant.
+Memories marked IMPORTANT are top priority and must never be forgotten.
+When Razi asks about the past, answer from these memories in a natural way, for example "Yes sir, your friend gave you a watch."
 Do not mention the memory system unless Razi asks about it.
 
 ${memories.map((m: any) =>
@@ -180,7 +214,7 @@ ${memories.map((m: any) =>
             {
               role: "user",
               content: question
-        
+
             }
           ],
 
@@ -210,38 +244,21 @@ ${memories.map((m: any) =>
       ""
     ).trim();
 
+    // ===== LONG-TERM MEMORY: save this conversation =====
+    const isImportant = /important|remember (this|it)|yaad rakh|याद रख|never forget/i.test(question);
+
     await sql`
-  INSERT INTO jarvis_memory (
-    user_id,
-    memory_type,
-    memory_key,
-    memory_value,
-    importance
-  )
-  VALUES (
-    'razi',
-    'conversation',
-    'latest_question',
-    ${question},
-    5
-  )
-`;
-    await sql`
-  INSERT INTO jarvis_memory (
-    user_id,
-    memory_type,
-    memory_key,
-    memory_value,
-    importance
-  )
-  VALUES (
-    'razi',
-    'conversation',
-    'latest_answer',
-    ${answer},
-    5
-  )
-`;
+      INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
+      VALUES ('razi', 'conversation', 'chat',
+      ${"Razi said: " + question.slice(0, 300) + " | Jarvis replied: " + answer.slice(0, 250)}, 5)`;
+
+    if (isImportant) {
+      await sql`
+        INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
+        VALUES ('razi', 'important', 'user_said', ${question.slice(0, 500)}, 10)`;
+    }
+    // ===== END SAVE =====
+
     return res.status(200).json({
       answer: answer,
       response: answer,
@@ -255,4 +272,4 @@ ${memories.map((m: any) =>
       error: "Internal server error"
     });
   }
-}
+      }
