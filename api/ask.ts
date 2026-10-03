@@ -78,6 +78,21 @@ export default async function handler(req: any, res: any) {
       ...related.map((m: any) => ({ memory_type: "old memory", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) })),
       ...recent.reverse().map((m: any) => ({ memory_type: "recent chat", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) }))
     ];
+    // ===== CURRENT CONVERSATION: last few turns as real chat messages =====
+    const ordered = [...recent].sort(
+      (a: any, b: any) => new Date(a.day).getTime() - new Date(b.day).getTime()
+    );
+    const history: any[] = [];
+    for (const m of ordered) {
+      const parts = String(m.memory_value).split(" | Jarvis replied: ");
+      const q = parts[0].replace(/^Razi said: /, "");
+      history.push({ role: "user", content: q });
+      if (parts[1]) {
+        history.push({ role: "assistant", content: parts[1] });
+      }
+    }
+    // ===== END CURRENT CONVERSATION =====
+
     // ===== END LONG-TERM MEMORY SEARCH =====
 
     const groqResponse = await fetch(
@@ -211,6 +226,7 @@ ${memories.map((m: any) =>
 
           `
             },
+            ...history,
             {
               role: "user",
               content: question
@@ -272,4 +288,4 @@ ${memories.map((m: any) =>
       error: "Internal server error"
     });
   }
-      }
+  }
