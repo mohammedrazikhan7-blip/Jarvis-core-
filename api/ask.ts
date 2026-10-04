@@ -73,7 +73,7 @@ export default async function handler(req: any, res: any) {
     const cut = (s: any) => String(s).slice(0, 300);
 
     memories = [
-      { memory_type: "TODAY", memory_key: "date", memory_value: dayOf(new Date()) },
+      { memory_type: "CURRENT DATE AND TIME (India)", memory_key: "now", memory_value: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "full", timeStyle: "short" }) },
       ...important.map((m: any) => ({ memory_type: "IMPORTANT, never forget", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) })),
       ...related.map((m: any) => ({ memory_type: "old memory", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) })),
       ...recent.reverse().map((m: any) => ({ memory_type: "recent chat", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) }))
@@ -163,7 +163,8 @@ LANGUAGE:
 KNOWLEDGE AND CURRENT INFORMATION:
 - Answer questions using your available knowledge.
 - When current information is required and an appropriate external information tool is available, use it rather than pretending to know.
-- Never invent current news, current time, current events, or facts.
+- The current date and time is given in the memory list as CURRENT DATE AND TIME. When Razi asks about the time or date, use it. Never say you do not have a clock.
+- Never invent current news, current events, or facts.
 - If you do not know something, say so briefly and explain what information would be needed.
 
 REASONING:
@@ -288,4 +289,4 @@ ${memories.map((m: any) =>
       error: "Internal server error"
     });
   }
-  }
+}
