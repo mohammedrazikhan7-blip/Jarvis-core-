@@ -44,6 +44,61 @@ export default async function handler(req: any, res: any) {
       });
     }
 
+    // ===== LIVE NEWS: fetch fresh headlines only when asked =====
+    const lowerQ = question.toLowerCase();
+    const asksNews =
+      /news|headline|breaking|samachar|khabar|समाचार|खबर/.test(lowerQ) ||
+      /(going on|happening|happened).*(india|world|america|usa|china|pakistan|russia|ukraine|israel|gaza|market|country)/.test(lowerQ);
+
+    let newsText = "";
+    let newsFailed = false;
+
+    if (asksNews) {
+      try {
+        const base = "hl=en-IN&gl=IN&ceid=IN:en";
+        let feed = "https://news.google.com/rss?" + base;
+
+        const topic = lowerQ.match(/america|usa|china|russia|ukraine|pakistan|israel|gaza|europe|japan|britain/);
+
+        if (/market|sensex|nifty|stock|share/.test(lowerQ)) {
+          feed = "https://news.google.com/rss/search?q=" + encodeURIComponent("Sensex Nifty stock market when:1d") + "&" + base;
+        } else if (topic) {
+          feed = "https://news.google.com/rss/search?q=" + encodeURIComponent(topic[0] + " when:1d") + "&" + base;
+        } else if (/world|international|global/.test(lowerQ) && !/india/.test(lowerQ)) {
+          feed = "https://news.google.com/rss/headlines/section/topic/WORLD?" + base;
+        }
+
+        const feedRes = await fetch(feed, { signal: AbortSignal.timeout(4000) });
+        const xml = await feedRes.text();
+
+        const titles = xml
+          .split("<item>")
+          .slice(1, 11)
+          .map((item: string) => {
+            const m = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
+            return m
+              ? m[1]
+                  .replace(/&amp;/g, "&")
+                  .replace(/&quot;/g, '"')
+                  .replace(/&#39;/g, "'")
+                  .replace(/ - [^-]+$/, "")
+                  .trim()
+              : "";
+          })
+          .filter((t: string) => t.length > 0);
+
+        if (titles.length > 0) {
+          newsText = titles.map((t: string, i: number) => `${i + 1}. ${t}`).join("\n");
+        } else {
+          newsFailed = true;
+        }
+      } catch (newsError) {
+        console.error("News fetch error:", newsError);
+        newsFailed = true;
+      }
+    }
+    // ===== END LIVE NEWS =====
+
     // ===== LONG-TERM MEMORY: find the memories that matter =====
     const stop = new Set(["what","when","where","which","this","that","there","about","with","from","have","does","your","tell","please","jarvis","remember","important","would","could","should","will","then","than","into","been","just","like","know","kya","hai","hain","mera","meri","mere","aur"]);
     const words = Array.from(new Set(
@@ -137,7 +192,7 @@ CONVERSATION:
 PERSONALITY:
 - Be friendly, warm, respectful, calm, and intelligent.
 - Razi is your creator and user.
-- You may naturally call him "sir", but do not repeat "sir" mechanically in every sentence.
+- Address him as "sir". Never call him by his name "Razi" when talking to him. Do not repeat "sir" in every sentence.
 - Never use "bro" to address him unless he explicitly asks you to.
 - Behave like a trusted personal companion rather than a formal software assistant.
 - Understand humor, sarcasm, playful comments, frustration, excitement, happiness, and other conversational tones.
@@ -224,6 +279,13 @@ Do not mention the memory system unless Razi asks about it.
 ${memories.map((m: any) =>
   `- ${m.memory_type}: ${m.memory_key} = ${m.memory_value}`
 ).join("\n")}
+
+${newsText ? `LIVE NEWS HEADLINES (fetched just now):
+${newsText}
+
+Razi asked about the news. Tell him only the 3 or 4 most important things, in simple spoken English, one short sentence each. Do not read all the headlines. Do not say you lack real-time news. Use only what the headlines say.` : ""}
+
+${newsFailed ? "Razi asked about the news, but the news could not be fetched right now. Say that briefly and offer to try again." : ""}
 
           `
             },
