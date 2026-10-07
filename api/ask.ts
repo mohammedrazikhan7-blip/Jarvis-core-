@@ -107,22 +107,24 @@ export default async function handler(req: any, res: any) {
     )).slice(0, 6);
     const patterns = words.map((w: string) => `%${w}%`);
 
-    const important = await sql`
-      SELECT memory_value, updated_at AS day FROM jarvis_memory
-      WHERE user_id = 'razi' AND importance >= 9
-      ORDER BY updated_at DESC LIMIT 15`;
-
-    const related = patterns.length ? await sql`
-      SELECT memory_value, updated_at AS day FROM jarvis_memory
-      WHERE user_id = 'razi' AND importance < 9
-      AND memory_key NOT IN ('latest_question', 'latest_answer')
-      AND memory_value ILIKE ANY(${patterns}::text[])
-      ORDER BY updated_at DESC LIMIT 8` : [];
-
-    const recent = await sql`
-      SELECT memory_value, updated_at AS day FROM jarvis_memory
-      WHERE user_id = 'razi' AND memory_key = 'chat'
-      ORDER BY updated_at DESC LIMIT 6`;
+    const [important, related, recent] = await Promise.all([
+      sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = 'razi' AND importance >= 9
+        ORDER BY updated_at DESC LIMIT 15`,
+      patterns.length
+        ? sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = 'razi' AND importance < 9
+        AND memory_key NOT IN ('latest_question', 'latest_answer')
+        AND memory_value ILIKE ANY(${patterns}::text[])
+        ORDER BY updated_at DESC LIMIT 8`
+        : Promise.resolve([] as any[]),
+      sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = 'razi' AND memory_key = 'chat'
+        ORDER BY updated_at DESC LIMIT 6`
+    ]);
 
     const dayOf = (x: any) => new Date(x).toISOString().slice(0, 10);
     const cut = (s: any) => String(s).slice(0, 300);
@@ -240,7 +242,8 @@ ${newsFailed ? "Razi asked about the news, but the news could not be fetched rig
           ],
 
           temperature: 0.9,
-          max_tokens: 500
+          reasoning_effort: "low",
+          max_tokens: 350
         })
       }
     );
@@ -292,4 +295,5 @@ ${newsFailed ? "Razi asked about the news, but the news could not be fetched rig
       error: "Internal server error"
     });
   }
-      }
+              }
+  
