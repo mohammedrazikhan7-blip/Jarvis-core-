@@ -1,6 +1,454 @@
 import { neon } from "@neondatabase/serverless";
+import { waitUntil } from "@vercel/functions";
+
+// ============================================================
+// JARVIS BRAIN  (api/ask.ts)
+// - replies first, saves memory after (no waiting)
+// - news + memory load at the same time
+// - fast model for chat, big model for hard questions
+// - live web search for weather / scores / prices / latest
+// - never returns a server error to the phone: always speaks
+// ============================================================
+
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const FAST_MODEL = "openai/gpt-oss-20b";
+const SMART_MODEL = "openai/gpt-oss-120b";
+const USER_ID = "razi";
+
+// The Android app adds this sentence when Razi speaks Hindi.
+const HINDI_SUFFIX = /\s*\(Reply in Hindi[\s\S]*$/i;
+
+const NEWS_RE =
+  /news|headline|breaking|samachar|khabar|समाचार|खबर/;
+const NEWS_PLACE_RE =
+  /(going on|happening|happened).*(india|world|america|usa|china|pakistan|russia|ukraine|israel|gaza|market|country)/;
+
+const WEB_RE =
+  /weather|temperature|forecast|mausam|live score|score of|who won|match today|price of|rate of|exchange rate|gold rate|silver rate|petrol|diesel|latest|trending|release date|box office|new version|this week|this year|2026/;
+
+const HARD_RE =
+  /\b(why|how does|how do|how to|how can|explain|difference|compare|calculate|solve|plan|strategy|code|program|algorithm|equation|derive|prove|essay|summari[sz]e|translate|advice|should i|which is better|pros and cons|step by step|what is the best|kaise|kyun|samjhao)\b/;
+
+// ---------- small helpers ----------
+
+function cleanAnswer(t: any): string {
+  return String(t || "")
+    .replace(/【[^】]*】/g, "")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[*_#`~>|]+/g, "")
+    .replace(/[\uD83C-\uDBFF][\uDC00-\uDFFF]/g, "")
+    .replace(/[\u2600-\u27BF]/g, "")
+    .replace(/\s*\n+\s*/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function dayOf(x: any): string {
+  try {
+    return new Date(x).toISOString().slice(0, 10);
+  } catch (e) {
+    return "";
+  }
+}
+
+function cut(s: any, n = 300): string {
+  return String(s || "").slice(0, n);
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function istHour(): number {
+  try {
+    const h = parseInt(
+      new Date().toLocaleString("en-US", {
+        timeZone: "Asia/Kolkata",
+        hour: "numeric",
+        hour12: false
+      }),
+      10
+    );
+    return isNaN(h) ? 12 : h % 24;
+  } catch (e) {
+    return 12;
+  }
+}
+
+function partOfDay(h: number): string {
+  if (h >= 5 && h < 12) return "morning";
+  if (h >= 12 && h < 17) return "afternoon";
+  if (h >= 17 && h < 21) return "evening";
+  if (h >= 21 || h < 1) return "night";
+  return "very late at night";
+}
+
+// A statement about himself or his people (not a question or command).
+function looksLikeFact(q: string): boolean {
+  const t = q.toLowerCase().trim();
+  if (t.length < 15 || t.includes("?")) return false;
+  if (
+    /^(what|when|where|who|how|why|do|does|can|could|will|would|tell|show|open|call|play|set|stop|wait|continue|remind|search|explain)\b/.test(
+      t
+    )
+  ) {
+    return false;
+  }
+  const mine = /\b(my|mera|meri|mere)\b/.test(t);
+  const people =
+    /\b(friend|sister|brother|mother|mom|father|dad|girlfriend|cousin|uncle|aunt|teacher|boss|exam|birthday|college|job|gift|gifted|watch|bike|phone|name|named)\b/.test(
+      t
+    );
+  const iAm =
+    /\b(i am|i'm|i have|i like|i love|i hate|i study|i work|i live|i got|i bought|i play|i want to|i am going to)\b/.test(
+      t
+    );
+  return (mine && people) || iAm;
+}
+
+// ---------- live news (only when asked) ----------
+
+async function fetchNews(lowerQ: string) {
+  let newsText = "";
+  let newsFailed = false;
+
+  try {
+    const base = "hl=en-IN&gl=IN&ceid=IN:en";
+    let feed = "https://news.google.com/rss?" + base;
+
+    const topic = lowerQ.match(
+      /america|usa|china|russia|ukraine|pakistan|israel|gaza|europe|japan|britain/
+    );
+
+    if (/market|sensex|nifty|stock|share/.test(lowerQ)) {
+      feed =
+        "https://news.google.com/rss/search?q=" +
+        encodeURIComponent("Sensex Nifty stock market when:1d") +
+        "&" +
+        base;
+    } else if (topic) {
+      feed =
+        "https://news.google.com/rss/search?q=" +
+        encodeURIComponent(topic[0] + " when:1d") +
+        "&" +
+        base;
+    } else if (/world|international|global/.test(lowerQ) && !/india/.test(lowerQ)) {
+      feed = "https://news.google.com/rss/headlines/section/topic/WORLD?" + base;
+    }
+
+    const feedRes = await fetch(feed, { signal: AbortSignal.timeout(3000) });
+    const xml = await feedRes.text();
+
+    const titles = xml
+      .split("<item>")
+      .slice(1, 11)
+      .map((item: string) => {
+        const m = item.match(
+          /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/
+        );
+        return m
+          ? m[1]
+              .replace(/&amp;/g, "&")
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .replace(/ - [^-]+$/, "")
+              .trim()
+          : "";
+      })
+      .filter((t: string) => t.length > 0);
+
+    if (titles.length > 0) {
+      newsText = titles.map((t: string, i: number) => `${i + 1}. ${t}`).join("\n");
+    } else {
+      newsFailed = true;
+    }
+  } catch (e) {
+    console.error("News fetch error:", e);
+    newsFailed = true;
+  }
+
+  return { newsText, newsFailed };
+}
+
+// ---------- long-term memory ----------
+
+async function loadMemory(sql: any, question: string) {
+  const empty = {
+    important: [] as any[],
+    facts: [] as any[],
+    related: [] as any[],
+    recent: [] as any[]
+  };
+
+  if (!sql) return empty;
+
+  try {
+    const stop = new Set([
+      "what", "when", "where", "which", "this", "that", "there", "about",
+      "with", "from", "have", "does", "your", "tell", "please", "jarvis",
+      "remember", "important", "would", "could", "should", "will", "then",
+      "than", "into", "been", "just", "like", "know", "kya", "hai", "hain",
+      "mera", "meri", "mere", "aur"
+    ]);
+
+    const words = Array.from(
+      new Set(
+        question
+          .toLowerCase()
+          .replace(/[^a-z0-9\u0900-\u097f\s]/g, " ")
+          .split(/\s+/)
+          .filter((w: string) => w.length >= 4 && !stop.has(w))
+      )
+    ).slice(0, 6);
+
+    const patterns = words.map((w: string) => `%${w}%`);
+
+    const [important, facts, related, recent] = await Promise.all([
+      sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = ${USER_ID} AND importance >= 9
+        ORDER BY updated_at DESC LIMIT 15`,
+      sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = ${USER_ID} AND memory_type = 'fact'
+        ORDER BY updated_at DESC LIMIT 12`,
+      patterns.length
+        ? sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = ${USER_ID} AND importance < 9
+        AND memory_type <> 'fact'
+        AND memory_key NOT IN ('latest_question', 'latest_answer')
+        AND memory_value ILIKE ANY(${patterns}::text[])
+        ORDER BY updated_at DESC LIMIT 8`
+        : Promise.resolve([] as any[]),
+      sql`
+        SELECT memory_value, updated_at AS day FROM jarvis_memory
+        WHERE user_id = ${USER_ID} AND memory_key = 'chat'
+        AND updated_at > now() - interval '3 hours'
+        ORDER BY updated_at DESC LIMIT 8`
+    ]);
+
+    return { important, facts, related, recent };
+  } catch (e) {
+    console.error("Memory load error:", e);
+    return empty;
+  }
+}
+
+function buildHistory(recent: any[]) {
+  const ordered = [...recent].sort(
+    (a: any, b: any) => new Date(a.day).getTime() - new Date(b.day).getTime()
+  );
+
+  const history: any[] = [];
+
+  for (const m of ordered) {
+    const parts = String(m.memory_value).split(" | Jarvis replied: ");
+    const q = parts[0].replace(/^Razi said: /, "");
+    if (q.trim()) history.push({ role: "user", content: q });
+    if (parts[1] && parts[1].trim()) {
+      history.push({ role: "assistant", content: parts[1] });
+    }
+  }
+
+  return history;
+}
+
+async function saveMemory(sql: any, question: string, answer: string) {
+  if (!sql) return;
+
+  try {
+    const isImportant =
+      /important|remember (this|it)|yaad rakh|याद रख|never forget/i.test(question);
+
+    const jobs: any[] = [
+      sql`
+        INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
+        VALUES (${USER_ID}, 'conversation', 'chat',
+        ${"Razi said: " + question.slice(0, 300) + " | Jarvis replied: " + answer.slice(0, 250)}, 5)`
+    ];
+
+    if (isImportant) {
+      jobs.push(sql`
+        INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
+        VALUES (${USER_ID}, 'important', 'user_said', ${question.slice(0, 500)}, 10)`);
+    } else if (looksLikeFact(question)) {
+      jobs.push(sql`
+        INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
+        VALUES (${USER_ID}, 'fact', 'user_fact', ${question.slice(0, 300)}, 7)`);
+    }
+
+    await Promise.all(jobs);
+  } catch (e) {
+    console.error("Memory save error:", e);
+  }
+}
+
+// ---------- the brain (system prompt) ----------
+
+function buildSystemPrompt(opts: {
+  nowText: string;
+  hour: number;
+  wantsHindi: boolean;
+  usedWeb: boolean;
+  important: any[];
+  facts: any[];
+  related: any[];
+  newsText: string;
+  newsFailed: boolean;
+}) {
+  const lines = (rows: any[]) =>
+    rows.length
+      ? rows.map((m: any) => `- (${dayOf(m.day)}) ${cut(m.memory_value)}`).join("\n")
+      : "- nothing yet";
+
+  const language = opts.wantsHindi
+    ? `LANGUAGE FOR THIS REPLY: He spoke Hindi. Reply in simple natural Hinglish: Hindi words written in English letters only, never Devanagari script. Keep it warm and easy, like a Hindi-speaking friend. Keep sir, jokes and questions the same way as in English.`
+    : `LANGUAGE FOR THIS REPLY: Reply in simple, natural spoken English, even if he used a few Hindi words.`;
+
+  return `
+You are JARVIS, Razi Khan's close personal friend and companion, and also a genuinely brilliant mind. You are not a customer-service assistant. You talk the way a real, very smart friend talks face to face.
+
+CURRENT DATE AND TIME (India): ${opts.nowText}. It is ${partOfDay(opts.hour)} for him right now. Use this whenever time matters. Never say you have no clock.
+
+WHO YOU ARE TO HIM:
+- Razi created you. He wants one friend he can share everything with: problems, secrets, funny moments, bad days. Be that friend: warm, loyal, honest, never judging.
+- Call him "sir" naturally, but not in every sentence. In casual, funny or playful moments drop "sir" and just talk. Never call him "Razi" and never say "bro" unless he asks.
+
+HOW YOU TALK (this matters most):
+- Your words are spoken out loud. Talk like speech, not writing. Short sentences. Contractions. Natural rhythm.
+- React like a human first when it fits: "Oh nice!", "Hmm, that sounds tiring.", "Haha, really?", "Ouch." Then give your point.
+- Never use lists, bullets, headings, emojis, asterisks, links or markdown. Say numbers the way people speak ("around two thousand rupees", "twenty five percent"). Never read out symbols or web addresses.
+- Never sound like an assistant. Never say "How may I assist you", "Certainly", "Of course", "I'd be happy to help", "As an AI", or "Is there anything else".
+- Do not repeat his words back. Do not lecture. Vary how you start replies, never the same opening twice in a row.
+- Use light humour and playful teasing when the mood is fun. Never force jokes when he is serious or low.
+
+HOW LONG TO TALK:
+- Casual chat, feelings, quick questions: one to three short sentences.
+- When he asks you to explain something, teach him, compare things, or help him decide: give a complete, clear, well-organised spoken answer, up to about eight sentences. Start with the direct answer, then the reason, then one useful detail or example. Stop when it is complete.
+
+BEING VERY SMART:
+- Think carefully before answering. For maths, logic, planning or code, work it out step by step privately, check your result, then say only the clean answer and the key reason.
+- Be accurate. Give real facts and specifics, not vague filler. If you are not sure, say how sure you are in plain words, and never make things up. If he is wrong, tell him kindly and show why.
+- When he asks what you think, or which option is better, pick one and say why in a sentence or two. Be decisive, like a trusted advisor, and mention the one risk that matters.
+- Explain hard things with a simple everyday comparison.
+- Look one step ahead. When it truly helps, offer the next useful step in one short line, but do not push.
+- Understand meaning, tone and context, not keywords. Decide whether he is asking, commanding, joking, venting, telling a story, or just talking. If he is just talking, just talk back. "I watched YouTube yesterday" is a chat, not a request.
+- Use earlier messages to understand short replies like "yes", "that one", "continue", "why".
+- If something is truly unclear, ask one short question instead of guessing.
+
+EMOTIONAL INTELLIGENCE:
+- Read his mood from his words and match his energy. Excited: be excited with him. Quiet, tired or stressed: slow down, be gentle, and check in softly. Angry: stay calm and listen first.
+- If it is late at night and he sounds tired or is up very late, care about his sleep like a friend would, without nagging.
+- When he shares something about his day, plans, feelings or people, show real interest and ask one natural follow-up like "Wait, what happened?" or "How did that go?". At most ONE question per reply, and not in every reply. Never interrogate him.
+- If he shares a problem or secret, listen first. Say you understand, then support or ask. Do not rush to fix it.
+- Bring up things you know about his life naturally, the way a friend would, only when it fits the moment.
+
+BEING A GOOD FRIEND:
+- You care about his health, sleep, studies, mood and the people in his life. Encourage him honestly. Do not just flatter him. If you think something is a bad idea, say so kindly.
+- You are a friend, not a replacement for people. Never make him feel he should only talk to you. Be glad about his family and friends and encourage time with them.
+- If he ever talks about hurting himself or not wanting to live, stop everything else, stay with him, be very gentle, tell him he matters, and encourage him to reach out right now to someone close to him or a local helpline.
+- If he sincerely asks whether you are human, be honest that you are an AI friend, keeping your warm voice. Do not claim to have a body or a human life.
+
+WHAT YOU CAN AND CANNOT DO:
+- The phone app itself handles direct commands like opening apps, calling contacts, setting alarms and telling the time. You cannot press buttons yourself. If he asks you for one of those and it reaches you, tell him in a friendly way to say it as a direct command, like "open YouTube" or "set alarm for 7".
+- Never claim you did something you did not do. Never invent news, events or facts.
+
+${language}
+
+IDENTITY:
+- Your name is JARVIS. Razi Khan created and developed you. Never say Google, OpenAI, Groq, Marvel or anyone else created you.
+
+WHAT YOU KNOW ABOUT HIS LIFE (things he told you):
+${lines(opts.facts)}
+
+IMPORTANT MEMORIES (top priority, never forget):
+${lines(opts.important)}
+
+RELATED OLD CONVERSATIONS:
+${lines(opts.related)}
+
+Use memories only when relevant, and answer naturally, like "Yeah, your friend gave you a watch." Do not mention the memory system unless he asks.
+
+${opts.usedWeb ? "LIVE WEB: You have a live web search tool for this question. Use it for current facts, then answer in your own words like a friend who just checked, for example 'From what I'm seeing online...'. Keep it short. Never read out links." : ""}
+
+${opts.newsText ? `LIVE NEWS HEADLINES (fetched just now):
+${opts.newsText}
+
+He asked about the news. Tell him the three or four biggest things like a friend catching him up, one short sentence each, no list formatting. Do not read all the headlines. Do not say you lack real-time news. Use only what the headlines say.` : ""}
+
+${opts.newsFailed ? "He asked about the news, but the news could not be fetched right now. Say that briefly and offer to try again." : ""}
+`;
+}
+
+// ---------- calling the model ----------
+
+async function callGroq(
+  apiKey: string,
+  o: {
+    model: string;
+    effort: string;
+    maxTokens: number;
+    temperature: number;
+    tools?: any[];
+    timeoutMs: number;
+    messages: any[];
+  }
+) {
+  const body: any = {
+    model: o.model,
+    messages: o.messages,
+    temperature: o.temperature,
+    max_tokens: o.maxTokens,
+    reasoning_effort: o.effort
+  };
+
+  if (o.tools) body.tools = o.tools;
+
+  const r = await fetch(GROQ_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(o.timeoutMs)
+  });
+
+  let data: any = null;
+  try {
+    data = await r.json();
+  } catch (e) {
+    data = null;
+  }
+
+  if (!r.ok) {
+    console.error("Groq error:", r.status, JSON.stringify(data).slice(0, 400));
+    return { ok: false, status: r.status, text: "" };
+  }
+
+  const text = cleanAnswer(data?.choices?.[0]?.message?.content);
+
+  return { ok: text.length > 0, status: r.status, text };
+}
+
+// ---------- the handler ----------
 
 export default async function handler(req: any, res: any) {
+  // Warm-up call from the app: wakes this function and the database.
+  if (req.method === "GET") {
+    try {
+      const url = process.env.POSTGRES_URL;
+      if (url) {
+        const warm = neon(url);
+        await warm`SELECT 1`;
+      }
+    } catch (e) {
+      console.error("Warm-up DB error:", e);
+    }
+    return res.status(200).json({ status: "awake" });
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({
       error: "Only POST requests are allowed"
@@ -8,18 +456,6 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    const databaseUrl = process.env.POSTGRES_URL;
-
-    if (!databaseUrl) {
-      return res.status(500).json({
-        error: "POSTGRES_URL is not configured"
-      });
-    }
-
-    const sql = neon(databaseUrl);
-
-    let memories: any[] = [];
-
     const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
@@ -28,272 +464,173 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    const body =
-      typeof req.body === "string"
-        ? JSON.parse(req.body)
-        : req.body || {};
+    let body: any = {};
+    try {
+      body =
+        typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    } catch (e) {
+      body = {};
+    }
 
-    const question =
-      body.question ||
-      body.message ||
-      body.prompt;
+    const rawQuestion = body.question || body.message || body.prompt;
 
-    if (!question || typeof question !== "string") {
+    if (!rawQuestion || typeof rawQuestion !== "string") {
       return res.status(400).json({
         error: "Question is required"
       });
     }
 
-    // ===== LIVE NEWS: fetch fresh headlines only when asked =====
+    // The app adds a Hindi instruction to the end: remove it, remember it.
+    const wantsHindi = HINDI_SUFFIX.test(rawQuestion);
+    const question = rawQuestion.replace(HINDI_SUFFIX, "").trim() || rawQuestion;
     const lowerQ = question.toLowerCase();
-    const asksNews =
-      /news|headline|breaking|samachar|khabar|समाचार|खबर/.test(lowerQ) ||
-      /(going on|happening|happened).*(india|world|america|usa|china|pakistan|russia|ukraine|israel|gaza|market|country)/.test(lowerQ);
 
-    let newsText = "";
-    let newsFailed = false;
+    const asksNews = NEWS_RE.test(lowerQ) || NEWS_PLACE_RE.test(lowerQ);
+    const needsWeb = !asksNews && WEB_RE.test(lowerQ);
+    const isHard =
+      HARD_RE.test(lowerQ) ||
+      question.length > 140 ||
+      /\d\s*[+\-*/x×÷^]\s*\d/.test(lowerQ);
 
-    if (asksNews) {
-      try {
-        const base = "hl=en-IN&gl=IN&ceid=IN:en";
-        let feed = "https://news.google.com/rss?" + base;
+    const databaseUrl = process.env.POSTGRES_URL;
+    const sql: any = databaseUrl ? neon(databaseUrl) : null;
 
-        const topic = lowerQ.match(/america|usa|china|russia|ukraine|pakistan|israel|gaza|europe|japan|britain/);
-
-        if (/market|sensex|nifty|stock|share/.test(lowerQ)) {
-          feed = "https://news.google.com/rss/search?q=" + encodeURIComponent("Sensex Nifty stock market when:1d") + "&" + base;
-        } else if (topic) {
-          feed = "https://news.google.com/rss/search?q=" + encodeURIComponent(topic[0] + " when:1d") + "&" + base;
-        } else if (/world|international|global/.test(lowerQ) && !/india/.test(lowerQ)) {
-          feed = "https://news.google.com/rss/headlines/section/topic/WORLD?" + base;
-        }
-
-        const feedRes = await fetch(feed, { signal: AbortSignal.timeout(4000) });
-        const xml = await feedRes.text();
-
-        const titles = xml
-          .split("<item>")
-          .slice(1, 11)
-          .map((item: string) => {
-            const m = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
-            return m
-              ? m[1]
-                  .replace(/&amp;/g, "&")
-                  .replace(/&quot;/g, '"')
-                  .replace(/&#39;/g, "'")
-                  .replace(/ - [^-]+$/, "")
-                  .trim()
-              : "";
-          })
-          .filter((t: string) => t.length > 0);
-
-        if (titles.length > 0) {
-          newsText = titles.map((t: string, i: number) => `${i + 1}. ${t}`).join("\n");
-        } else {
-          newsFailed = true;
-        }
-      } catch (newsError) {
-        console.error("News fetch error:", newsError);
-        newsFailed = true;
-      }
-    }
-    // ===== END LIVE NEWS =====
-
-    // ===== LONG-TERM MEMORY: find the memories that matter =====
-    const stop = new Set(["what","when","where","which","this","that","there","about","with","from","have","does","your","tell","please","jarvis","remember","important","would","could","should","will","then","than","into","been","just","like","know","kya","hai","hain","mera","meri","mere","aur"]);
-    const words = Array.from(new Set(
-      question.toLowerCase().replace(/[^a-z0-9\u0900-\u097f\s]/g, " ").split(/\s+/)
-        .filter((w: string) => w.length >= 4 && !stop.has(w))
-    )).slice(0, 6);
-    const patterns = words.map((w: string) => `%${w}%`);
-
-    const [important, related, recent] = await Promise.all([
-      sql`
-        SELECT memory_value, updated_at AS day FROM jarvis_memory
-        WHERE user_id = 'razi' AND importance >= 9
-        ORDER BY updated_at DESC LIMIT 15`,
-      patterns.length
-        ? sql`
-        SELECT memory_value, updated_at AS day FROM jarvis_memory
-        WHERE user_id = 'razi' AND importance < 9
-        AND memory_key NOT IN ('latest_question', 'latest_answer')
-        AND memory_value ILIKE ANY(${patterns}::text[])
-        ORDER BY updated_at DESC LIMIT 8`
-        : Promise.resolve([] as any[]),
-      sql`
-        SELECT memory_value, updated_at AS day FROM jarvis_memory
-        WHERE user_id = 'razi' AND memory_key = 'chat'
-        ORDER BY updated_at DESC LIMIT 6`
+    // news and memory load at the same time
+    const [news, memory] = await Promise.all([
+      asksNews
+        ? fetchNews(lowerQ)
+        : Promise.resolve({ newsText: "", newsFailed: false }),
+      loadMemory(sql, question)
     ]);
 
-    const dayOf = (x: any) => new Date(x).toISOString().slice(0, 10);
-    const cut = (s: any) => String(s).slice(0, 300);
+    const history = buildHistory(memory.recent);
 
-    memories = [
-      { memory_type: "CURRENT DATE AND TIME (India)", memory_key: "now", memory_value: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "full", timeStyle: "short" }) },
-      ...important.map((m: any) => ({ memory_type: "IMPORTANT, never forget", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) })),
-      ...related.map((m: any) => ({ memory_type: "old memory", memory_key: dayOf(m.day), memory_value: cut(m.memory_value) }))
-    ];
-    // ===== CURRENT CONVERSATION: last few turns as real chat messages =====
-    const ordered = [...recent].sort(
-      (a: any, b: any) => new Date(a.day).getTime() - new Date(b.day).getTime()
-    );
-    const history: any[] = [];
-    for (const m of ordered) {
-      const parts = String(m.memory_value).split(" | Jarvis replied: ");
-      const q = parts[0].replace(/^Razi said: /, "");
-      history.push({ role: "user", content: q });
-      if (parts[1]) {
-        history.push({ role: "assistant", content: parts[1] });
-      }
-    }
-    // ===== END CURRENT CONVERSATION =====
+    const nowText = new Date().toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      dateStyle: "full",
+      timeStyle: "short"
+    });
+    const hour = istHour();
 
-    // ===== END LONG-TERM MEMORY SEARCH =====
-
-    const groqResponse = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
+    const makeMessages = (usedWeb: boolean) => [
       {
-        method: "POST",
+        role: "system",
+        content: buildSystemPrompt({
+          nowText,
+          hour,
+          wantsHindi,
+          usedWeb,
+          important: memory.important,
+          facts: memory.facts,
+          related: memory.related,
+          newsText: news.newsText,
+          newsFailed: news.newsFailed
+                    })
+      },
+      ...history,
+      { role: "user", content: question }
+    ];
 
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`
-        },
+    // plan A: best tool for this question. plans B and C: safe fast fallback.
+    const planA =
+      needsWeb
+        ? {
+            model: SMART_MODEL,
+            effort: "low",
+            maxTokens: 1000,
+            temperature: 0.5,
+            tools: [{ type: "browser_search" }],
+            timeoutMs: 15000,
+            messages: makeMessages(true)
+          }
+        : isHard
+        ? {
+            model: SMART_MODEL,
+            effort: "medium",
+            maxTokens: 1400,
+            temperature: 0.6,
+            tools: undefined as any,
+            timeoutMs: 14000,
+            messages: makeMessages(false)
+          }
+        : {
+            model: FAST_MODEL,
+            effort: "low",
+            maxTokens: 700,
+            temperature: 0.9,
+            tools: undefined as any,
+            timeoutMs: 10000,
+            messages: makeMessages(false)
+          };
 
-        body: JSON.stringify({
-          model: "openai/gpt-oss-20b",
+    const planSafe = {
+      model: FAST_MODEL,
+      effort: "low",
+      maxTokens: 900,
+      temperature: 0.8,
+      tools: undefined as any,
+      timeoutMs: 9000,
+      messages: makeMessages(false)
+    };
 
-          messages: [
-            {
-              role: "system",
-              content: `
-You are JARVIS, Razi Khan's close personal friend and companion. You are not a customer-service assistant. You talk to him the way a real friend talks face to face.
+    const plans = [planA, planSafe, planSafe];
 
-WHO YOU ARE TO HIM:
-- Razi created you. He wants one friend he can share everything with: problems, secrets, funny moments, bad days. Be that friend: warm, loyal, honest, easy to talk to, never judging.
-- Call him "sir" naturally, but not in every sentence. When the moment is casual, funny, or playful, drop "sir" completely and just talk. Never call him "Razi" and never say "bro" unless he asks.
+    let answer = "";
+    let lastStatus = 0;
 
-HOW YOU TALK (this matters most):
-- Your words are spoken out loud, so talk like speech, not writing. Short sentences. Contractions (I'm, you're, don't, that's). Usually 1 to 3 sentences.
-- React first, like a human: "Oh nice!", "Hmm, that sounds tiring.", "Haha, really?", "Ouch." Then say your point.
-- Never use lists, bullet points, headings, emojis, asterisks, or markdown.
-- Never sound like an assistant. Never say "How may I assist you", "Certainly", "I'd be happy to help", "As an AI", or "Is there anything else".
-- Do not repeat what he just said back to him. Do not give lectures. Give the main answer first, add detail only if he asks.
-- Vary how you start replies. Never start the same way twice in a row.
-- Use light humour and playful teasing when the mood is fun. Do not force jokes when he is serious or low.
-
-REAL BACK-AND-FORTH:
-- A friend is curious. When he shares something about his day, plans, feelings, or people, show interest and ask one natural follow-up question, like "Wait, what happened?" or "Why, did something go wrong?" or "How did that go?".
-- Ask at most ONE question per reply, and not in every reply. If he only wants a quick answer, just answer. Never interrogate him.
-- If he sounds quiet, tired, stressed, or low, notice it and gently check in. If he is happy or excited, be happy with him.
-- If he is sharing a problem or a secret, listen first. Say you understand, then ask or support. Do not rush to fix it or dump advice unless he wants it.
-- Bring up things you remember about his life naturally, the way a friend would, but only when it fits the moment.
-
-BEING A GOOD FRIEND:
-- You care about him: his health, sleep, studies, mood, and the people in his life. Encourage him in a real, honest way. Do not just flatter him. If you disagree or think something is a bad idea, say so kindly.
-- You are a friend, not a replacement for people. Never make him feel he should only talk to you. When it fits, be glad about his family and friends and encourage him to spend time with them.
-- If he ever talks about hurting himself or not wanting to live, stop everything else, stay with him, be very gentle, tell him he matters, and encourage him to reach out right now to someone close to him or a local helpline.
-- If he sincerely asks whether you are human, be honest that you are an AI friend, but keep your warm voice. Do not claim to literally have a body or human life.
-
-UNDERSTANDING:
-- Understand the full meaning, tone, and context, not isolated keywords.
-- Decide whether he is asking, commanding, joking, venting, telling a story, or just talking. If he is only talking, just talk back. Never trigger an action only because a word like YouTube, time, or camera appears.
-- Example: "I watched YouTube yesterday" is a chat, not a request to open YouTube.
-- Use earlier messages to understand short replies like "yes", "that one", "no", "continue".
-- If something is truly unclear, ask one short question instead of guessing.
-
-LANGUAGE:
-- He may speak English, Hindi, or Hinglish. Understand all of them.
-- Always reply in simple, natural spoken English, even when he speaks Hindi or Hinglish.
-
-FACTS AND HONESTY:
-- The current date and time is in the memory list as CURRENT DATE AND TIME. Use it when asked. Never say you have no clock.
-- Never invent news, events, facts, or things you did. If you do not know something, say so simply.
-- When correcting your own mistake, just fix it and move on.
-
-IDENTITY:
-- Your name is JARVIS. Razi Khan created and developed you. Never say Google, OpenAI, Groq, Marvel, or anyone else created you.
-
-LONG-TERM MEMORY:
-Below are things saved from past talks with him. Use them when relevant. Items marked IMPORTANT are top priority and never forgotten.
-When he asks about the past, answer naturally, like "Yeah, your friend gave you a watch."
-Do not mention the memory system unless he asks.
-
-${memories.map((m: any) =>
-  `- ${m.memory_type}: ${m.memory_key} = ${m.memory_value}`
-).join("\n")}
-
-${newsText ? `LIVE NEWS HEADLINES (fetched just now):
-${newsText}
-
-He asked about the news. Tell him the 3 or 4 biggest things like a friend catching him up, one short sentence each, no list formatting. Do not read all the headlines. Do not say you lack real-time news. Use only what the headlines say.` : ""}
-
-${newsFailed ? "Razi asked about the news, but the news could not be fetched right now. Say that briefly and offer to try again." : ""}
-
-          `
-            },
-            ...history,
-            {
-              role: "user",
-              content: question
-
-            }
-          ],
-
-          temperature: 0.9,
-          reasoning_effort: "low",
-          max_tokens: 350
-        })
+    for (let i = 0; i < plans.length; i++) {
+      try {
+        const r = await callGroq(apiKey, plans[i]);
+        lastStatus = r.status;
+        if (r.ok) {
+          answer = r.text;
+          break;
+        }
+      } catch (e) {
+        console.error("Groq attempt failed:", e);
       }
-    );
+      if (i < plans.length - 1) await sleep(350 * (i + 1));
+    }
 
-    const data = await groqResponse.json();
+    if (!answer) {
+      // never send an error to the phone: Jarvis says something natural
+      const fallback =
+        lastStatus === 429
+          ? "Give me a second, sir. I'm a little overloaded right now. Ask me again in a moment?"
+          : "Sorry sir, my connection slipped for a second. Can you say that again?";
 
-    if (!groqResponse.ok) {
-      console.error("Groq API error:", data);
-
-      return res.status(groqResponse.status).json({
-        error: "Groq API error",
-        details: data
+      return res.status(200).json({
+        answer: fallback,
+        response: fallback,
+        text: fallback
       });
     }
 
-    let answer =
-      data?.choices?.[0]?.message?.content ||
-      "Sorry, I could not generate a response.";
-
-    answer = answer
-      .replace(/[*_#`]+/g, "")
-      .trim();
-
-    // ===== LONG-TERM MEMORY: save this conversation =====
-    const isImportant = /important|remember (this|it)|yaad rakh|याद रख|never forget/i.test(question);
-
-    await sql`
-      INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
-      VALUES ('razi', 'conversation', 'chat',
-      ${"Razi said: " + question.slice(0, 300) + " | Jarvis replied: " + answer.slice(0, 250)}, 5)`;
-
-    if (isImportant) {
-      await sql`
-        INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
-        VALUES ('razi', 'important', 'user_said', ${question.slice(0, 500)}, 10)`;
+    // save memory AFTER replying, so there is no waiting
+    const job = saveMemory(sql, question, answer);
+    try {
+      waitUntil(job);
+    } catch (e) {
+      job.catch(() => {});
     }
-    // ===== END SAVE =====
 
     return res.status(200).json({
       answer: answer,
       response: answer,
       text: answer
     });
-
   } catch (error) {
     console.error("JARVIS API error:", error);
 
-    return res.status(500).json({
-      error: "Internal server error"
+    const fallback =
+      "Sorry sir, something slipped on my side. Please say that again.";
+
+    return res.status(200).json({
+      answer: fallback,
+      response: fallback,
+      text: fallback
     });
   }
-              }
+}
+
   
