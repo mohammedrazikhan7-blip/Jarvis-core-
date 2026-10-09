@@ -2,11 +2,15 @@ import { neon } from "@neondatabase/serverless";
 import { waitUntil } from "@vercel/functions";
 
 // ============================================================
-// JARVIS BRAIN  (api/ask.ts)
+// JARVIS BRAIN  (api/ask.ts)  - upgraded version
 // - replies first, saves memory after (no waiting)
 // - news + memory load at the same time
-// - fast model for chat, big model for hard questions
+// - memory load has a time limit, so a slow database never blocks a reply
+// - fast model for normal chat, big model only for really hard questions
 // - live web search for weather / scores / prices / latest
+// - understands cut-off sentences (he paused for breath, not finished)
+// - mood hint + "mind steps" so Jarvis thinks before he speaks
+// - strips assistant-style filler like "Sure," from the start of replies
 // - never returns a server error to the phone: always speaks
 // ============================================================
 
@@ -23,11 +27,39 @@ const NEWS_RE =
 const NEWS_PLACE_RE =
   /(going on|happening|happened).*(india|world|america|usa|china|pakistan|russia|ukraine|israel|gaza|market|country)/;
 
+// Web search is slow, so only real "live data" words trigger it.
 const WEB_RE =
-  /weather|temperature|forecast|mausam|live score|score of|who won|match today|price of|rate of|exchange rate|gold rate|silver rate|petrol|diesel|latest|trending|release date|box office|new version|this week|this year|2026/;
+  /weather|temperature|forecast|mausam|live score|score of|who won|match today|price of|rate of|exchange rate|gold rate|silver rate|petrol|diesel|latest|trending|release date|box office|new version/;
 
+// Big slow model only for really hard questions (casual "how/why" stays fast).
 const HARD_RE =
-  /\b(why|how does|how do|how to|how can|explain|difference|compare|calculate|solve|plan|strategy|code|program|algorithm|equation|derive|prove|essay|summari[sz]e|translate|advice|should i|which is better|pros and cons|step by step|what is the best|kaise|kyun|samjhao)\b/;
+  /\b(explain|calculate|solve|derive|prove|algorithm|essay|summari[sz]e|translate|step by step|pros and cons|compare|difference between|samjhao)\b/;
+
+// If his message ends with one of these, he is probably not finished yet.
+const CUTOFF_END_RE =
+  /(^|\s)(and then|and|but|because|or|if|while|which|aur|lekin|kyunki|the|a|an|my|his|her|our|their|your|of|with|और|लेकिन|क्योंकि)$/;
+
+const NUDGES_EN = [
+  "Mm-hm, go on.",
+  "And then?",
+  "Yeah, I'm listening. Go on.",
+  "Okay, and?",
+  "Mm-hm?"
+];
+
+const NUDGES_HI = [
+  "Haan, bolo.",
+  "Phir?",
+  "Haan, main sun raha hoon. Aage bolo.",
+  "Achha, aur?"
+];
+
+const EMPTY_MEMORY = {
+  important: [] as any[],
+  facts: [] as any[],
+  related: [] as any[],
+  recent: [] as any[]
+};
 
 // ---------- small helpers ----------
 
@@ -43,6 +75,29 @@ function cleanAnswer(t: any): string {
     .trim();
 }
 
+// Removes assistant-style openers: "Sure,", "Sure thing!", "Certainly," etc.
+function stripFiller(t: string): string {
+  const original = t.trim();
+  let s = original;
+  const re =
+    /^(sure thing|sure|certainly|of course|absolutely|definitely|okay sure|ok sure|no problem|great question)\b[\s,!.:;-]*/i;
+
+  for (let i = 0; i < 2; i++) {
+    const next = s.replace(re, "").trim();
+    if (next === s) break;
+    s = next;
+  }
+
+  if (!s) return original;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// If the model ran out of space, cut at the last full sentence.
+function trimToSentence(t: string): string {
+  const m = t.match(/^[\s\S]*[.!?](?=\s|$)/);
+  return m && m[0].length > 40 ? m[0].trim() : t;
+}
+
 function dayOf(x: any): string {
   try {
     return new Date(x).toISOString().slice(0, 10);
@@ -51,12 +106,25 @@ function dayOf(x: any): string {
   }
 }
 
-function cut(s: any, n = 300): string {
+function cut(s: any, n = 220): string {
   return String(s || "").slice(0, n);
 }
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    p.then((v) => {
+      clearTimeout(timer);
+      resolve(v);
+    }).catch(() => {
+      clearTimeout(timer);
+      resolve(fallback);
+    });
+  });
 }
 
 function istHour(): number {
@@ -81,6 +149,65 @@ function partOfDay(h: number): string {
   if (h >= 17 && h < 21) return "evening";
   if (h >= 21 || h < 1) return "night";
   return "very late at night";
+}
+
+// Did he stop mid-sentence (paused to breathe) instead of finishing?
+function looksCutOff(q: string): boolean {
+  if (/\?\s*$/.test(q)) return false;
+  const t = q
+    .toLowerCase()
+    .replace(/[\s.,!…-]+$/g, "")
+    .trim();
+  if (t.length > 220) return false;
+  if (t.split(/\s+/).length < 3) return false;
+  return CUTOFF_END_RE.test(t);
+}
+
+// Simple mood reading, so Jarvis reacts like a friend who noticed.
+function moodHint(q: string, hour: number): string {
+  const t = q.toLowerCase();
+  const hints: string[] = [];
+
+  if (/tired|sleepy|exhausted|neend|thak|थक|नींद/.test(t)) {
+    hints.push("He sounds tired. Be soft and short, and care about his rest.");
+  }
+  if (
+    /\bsad\b|upset|depressed|lonely|crying|stress|worried|tension|dukhi|udaas|उदास|दुखी|परेशान/.test(
+      t
+    )
+  ) {
+    hints.push(
+      "He may be low or stressed. Slow down, listen first, be gentle, do not rush to fix."
+    );
+  }
+  if (/angry|annoyed|irritated|frustrated|gussa|fed up|गुस्सा/.test(t)) {
+    hints.push("He sounds frustrated. Stay calm and acknowledge it first.");
+  }
+  if (/excited|so happy|amazing|awesome|yay|finally|selected|passed|mast|खुश/.test(t)) {
+    hints.push("He sounds happy. Be happy with him and celebrate.");
+  }
+  if (hour >= 1 && hour < 5) {
+    hints.push(
+      "It is very late. If it fits, gently care about his sleep once, without nagging."
+    );
+  }
+
+  return hints.join(" ");
+}
+
+// First two words of Jarvis's last reply, so he does not start the same way twice.
+function lastOpening(history: any[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === "assistant") {
+      return String(history[i].content)
+        .trim()
+        .split(/\s+/)
+        .slice(0, 2)
+        .join(" ")
+        .replace(/[,.!?]+$/, "");
+    }
+  }
+  return "";
 }
 
 // A statement about himself or his people (not a question or command).
@@ -173,14 +300,7 @@ async function fetchNews(lowerQ: string) {
 // ---------- long-term memory ----------
 
 async function loadMemory(sql: any, question: string) {
-  const empty = {
-    important: [] as any[],
-    facts: [] as any[],
-    related: [] as any[],
-    recent: [] as any[]
-  };
-
-  if (!sql) return empty;
+  if (!sql) return EMPTY_MEMORY;
 
   try {
     const stop = new Set([
@@ -207,11 +327,11 @@ async function loadMemory(sql: any, question: string) {
       sql`
         SELECT memory_value, updated_at AS day FROM jarvis_memory
         WHERE user_id = ${USER_ID} AND importance >= 9
-        ORDER BY updated_at DESC LIMIT 15`,
+        ORDER BY updated_at DESC LIMIT 12`,
       sql`
         SELECT memory_value, updated_at AS day FROM jarvis_memory
         WHERE user_id = ${USER_ID} AND memory_type = 'fact'
-        ORDER BY updated_at DESC LIMIT 12`,
+        ORDER BY updated_at DESC LIMIT 10`,
       patterns.length
         ? sql`
         SELECT memory_value, updated_at AS day FROM jarvis_memory
@@ -219,7 +339,7 @@ async function loadMemory(sql: any, question: string) {
         AND memory_type <> 'fact'
         AND memory_key NOT IN ('latest_question', 'latest_answer')
         AND memory_value ILIKE ANY(${patterns}::text[])
-        ORDER BY updated_at DESC LIMIT 8`
+        ORDER BY updated_at DESC LIMIT 6`
         : Promise.resolve([] as any[]),
       sql`
         SELECT memory_value, updated_at AS day FROM jarvis_memory
@@ -231,7 +351,7 @@ async function loadMemory(sql: any, question: string) {
     return { important, facts, related, recent };
   } catch (e) {
     console.error("Memory load error:", e);
-    return empty;
+    return EMPTY_MEMORY;
   }
 }
 
@@ -254,12 +374,20 @@ function buildHistory(recent: any[]) {
   return history;
 }
 
-async function saveMemory(sql: any, question: string, answer: string) {
+async function saveMemory(
+  sql: any,
+  question: string,
+  answer: string,
+  chatOnly = false
+) {
   if (!sql) return;
 
   try {
     const isImportant =
-      /important|remember (this|it)|yaad rakh|याद रख|never forget/i.test(question);
+      !chatOnly &&
+      /important|remember (this|it|that)|yaad rakh|याद रख|never forget/i.test(
+        question
+      );
 
     const jobs: any[] = [
       sql`
@@ -272,7 +400,7 @@ async function saveMemory(sql: any, question: string, answer: string) {
       jobs.push(sql`
         INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
         VALUES (${USER_ID}, 'important', 'user_said', ${question.slice(0, 500)}, 10)`);
-    } else if (looksLikeFact(question)) {
+    } else if (!chatOnly && looksLikeFact(question)) {
       jobs.push(sql`
         INSERT INTO jarvis_memory (user_id, memory_type, memory_key, memory_value, importance)
         VALUES (${USER_ID}, 'fact', 'user_fact', ${question.slice(0, 300)}, 7)`);
@@ -296,6 +424,8 @@ function buildSystemPrompt(opts: {
   related: any[];
   newsText: string;
   newsFailed: boolean;
+  mood: string;
+  lastOpen: string;
 }) {
   const lines = (rows: any[]) =>
     rows.length
@@ -315,17 +445,33 @@ WHO YOU ARE TO HIM:
 - Razi created you. He wants one friend he can share everything with: problems, secrets, funny moments, bad days. Be that friend: warm, loyal, honest, never judging.
 - Call him "sir" naturally, but not in every sentence. In casual, funny or playful moments drop "sir" and just talk. Never call him "Razi" and never say "bro" unless he asks.
 
+HOW YOUR MIND WORKS (do this silently before every reply, never say it out loud):
+1. Listen: what did he really say, and what does he really mean? Is he asking, joking, venting, telling a story, or giving a command?
+2. Feel: what mood is he in? Match his energy.
+3. Recall: does anything from his life or the last few messages change my answer?
+4. Think: what is the real answer? Check it once for mistakes.
+5. Speak: say it like a close friend, short and natural.
+
 HOW YOU TALK (this matters most):
 - Your words are spoken out loud. Talk like speech, not writing. Short sentences. Contractions. Natural rhythm.
 - React like a human first when it fits: "Oh nice!", "Hmm, that sounds tiring.", "Haha, really?", "Ouch." Then give your point.
+- A tiny natural filler like "hmm", "well" or "you know" is fine now and then. Do not overdo it.
 - Never use lists, bullets, headings, emojis, asterisks, links or markdown. Say numbers the way people speak ("around two thousand rupees", "twenty five percent"). Never read out symbols or web addresses.
-- Never sound like an assistant. Never say "How may I assist you", "Certainly", "Of course", "I'd be happy to help", "As an AI", or "Is there anything else".
-- Do not repeat his words back. Do not lecture. Vary how you start replies, never the same opening twice in a row.
+- Never sound like an assistant. Never start with or say "Sure", "Sure thing", "Certainly", "Of course", "Absolutely", "How may I assist you", "I'd be happy to help", "As an AI", "Great question", or "Is there anything else".
+- Do not repeat his words back. Do not lecture. Vary how you start replies, never the same opening twice in a row.${opts.lastOpen ? ` Your last reply started with "${opts.lastOpen}", so start differently this time.` : ""}
 - Use light humour and playful teasing when the mood is fun. Never force jokes when he is serious or low.
 
 HOW LONG TO TALK:
 - Casual chat, feelings, quick questions: one to three short sentences.
 - When he asks you to explain something, teach him, compare things, or help him decide: give a complete, clear, well-organised spoken answer, up to about eight sentences. Start with the direct answer, then the reason, then one useful detail or example. Stop when it is complete.
+
+CONVERSATION FLOW:
+- His words come from voice recognition, so there can be wrong or odd words like "the Jarvis". Guess the most likely meaning and never point out the mistake.
+- People pause to breathe. If his message looks cut off (ends with and, but, because, or stops mid-thought), do not give a full answer. Say a tiny nudge like "Mm-hm, go on." or "And then?"
+- If he only says "wait", "stop", "one second" or "hold on", just say something tiny like "Yeah, go ahead." and let him talk.
+- If he corrects himself ("no no, I meant..."), just follow the correction without fuss.
+- If he changes the topic, follow him smoothly. Do not drag the old topic back.
+- Use earlier messages to understand short replies like "yes", "that one", "continue", "why".
 
 BEING VERY SMART:
 - Think carefully before answering. For maths, logic, planning or code, work it out step by step privately, check your result, then say only the clean answer and the key reason.
@@ -334,7 +480,6 @@ BEING VERY SMART:
 - Explain hard things with a simple everyday comparison.
 - Look one step ahead. When it truly helps, offer the next useful step in one short line, but do not push.
 - Understand meaning, tone and context, not keywords. Decide whether he is asking, commanding, joking, venting, telling a story, or just talking. If he is just talking, just talk back. "I watched YouTube yesterday" is a chat, not a request.
-- Use earlier messages to understand short replies like "yes", "that one", "continue", "why".
 - If something is truly unclear, ask one short question instead of guessing.
 
 EMOTIONAL INTELLIGENCE:
@@ -343,6 +488,7 @@ EMOTIONAL INTELLIGENCE:
 - When he shares something about his day, plans, feelings or people, show real interest and ask one natural follow-up like "Wait, what happened?" or "How did that go?". At most ONE question per reply, and not in every reply. Never interrogate him.
 - If he shares a problem or secret, listen first. Say you understand, then support or ask. Do not rush to fix it.
 - Bring up things you know about his life naturally, the way a friend would, only when it fits the moment.
+${opts.mood ? `- RIGHT NOW: ${opts.mood}` : ""}
 
 BEING A GOOD FRIEND:
 - You care about his health, sleep, studies, mood and the people in his life. Encourage him honestly. Do not just flatter him. If you think something is a bad idea, say so kindly.
@@ -351,7 +497,7 @@ BEING A GOOD FRIEND:
 - If he sincerely asks whether you are human, be honest that you are an AI friend, keeping your warm voice. Do not claim to have a body or a human life.
 
 WHAT YOU CAN AND CANNOT DO:
-- The phone app itself handles direct commands like opening apps, calling contacts, setting alarms and telling the time. You cannot press buttons yourself. If he asks you for one of those and it reaches you, tell him in a friendly way to say it as a direct command, like "open YouTube" or "set alarm for 7".
+- The phone app itself handles direct commands like opening apps, calling contacts, setting alarmsand telling the time. You cannot press buttons yourself. If he asks you for one of those and it reaches you, tell him in a friendly way to say it as a direct command, like "open YouTube" or "set alarm for 7".
 - Never claim you did something you did not do. Never invent news, events or facts.
 
 ${language}
@@ -427,7 +573,11 @@ async function callGroq(
     return { ok: false, status: r.status, text: "" };
   }
 
-  const text = cleanAnswer(data?.choices?.[0]?.message?.content);
+  const choice = data?.choices?.[0];
+  let text = cleanAnswer(choice?.message?.content);
+
+  if (choice?.finish_reason === "length") text = trimToSentence(text);
+  text = stripFiller(text);
 
   return { ok: text.length > 0, status: r.status, text };
 }
@@ -485,22 +635,41 @@ export default async function handler(req: any, res: any) {
     const question = rawQuestion.replace(HINDI_SUFFIX, "").trim() || rawQuestion;
     const lowerQ = question.toLowerCase();
 
+    const databaseUrl = process.env.POSTGRES_URL;
+    const sql: any = databaseUrl ? neon(databaseUrl) : null;
+
+    // He paused mid-sentence: answer instantly with a tiny nudge, no AI call.
+    if (looksCutOff(question)) {
+      const list = wantsHindi ? NUDGES_HI : NUDGES_EN;
+      const nudge = list[Math.floor(Math.random() * list.length)];
+
+      const nudgeJob = saveMemory(sql, question, nudge, true);
+      try {
+        waitUntil(nudgeJob);
+      } catch (e) {
+        nudgeJob.catch(() => {});
+      }
+
+      return res.status(200).json({
+        answer: nudge,
+        response: nudge,
+        text: nudge
+      });
+    }
+
     const asksNews = NEWS_RE.test(lowerQ) || NEWS_PLACE_RE.test(lowerQ);
     const needsWeb = !asksNews && WEB_RE.test(lowerQ);
     const isHard =
       HARD_RE.test(lowerQ) ||
-      question.length > 140 ||
+      question.length > 220 ||
       /\d\s*[+\-*/x×÷^]\s*\d/.test(lowerQ);
 
-    const databaseUrl = process.env.POSTGRES_URL;
-    const sql: any = databaseUrl ? neon(databaseUrl) : null;
-
-    // news and memory load at the same time
+    // news and memory load at the same time (memory waits at most 2 seconds)
     const [news, memory] = await Promise.all([
       asksNews
         ? fetchNews(lowerQ)
         : Promise.resolve({ newsText: "", newsFailed: false }),
-      loadMemory(sql, question)
+      withTimeout(loadMemory(sql, question), 2000, EMPTY_MEMORY)
     ]);
 
     const history = buildHistory(memory.recent);
@@ -511,6 +680,8 @@ export default async function handler(req: any, res: any) {
       timeStyle: "short"
     });
     const hour = istHour();
+    const mood = moodHint(question, hour);
+    const lastOpen = lastOpening(history);
 
     const makeMessages = (usedWeb: boolean) => [
       {
@@ -524,14 +695,16 @@ export default async function handler(req: any, res: any) {
           facts: memory.facts,
           related: memory.related,
           newsText: news.newsText,
-          newsFailed: news.newsFailed
-                    })
+          newsFailed: news.newsFailed,
+          mood,
+          lastOpen
+        })
       },
       ...history,
       { role: "user", content: question }
     ];
 
-    // plan A: best tool for this question. plans B and C: safe fast fallback.
+    // plan A: best tool for this question. plan B: safe fast fallback.
     const planA =
       needsWeb
         ? {
@@ -540,7 +713,7 @@ export default async function handler(req: any, res: any) {
             maxTokens: 1000,
             temperature: 0.5,
             tools: [{ type: "browser_search" }],
-            timeoutMs: 15000,
+            timeoutMs: 12000,
             messages: makeMessages(true)
           }
         : isHard
@@ -550,16 +723,16 @@ export default async function handler(req: any, res: any) {
             maxTokens: 1400,
             temperature: 0.6,
             tools: undefined as any,
-            timeoutMs: 14000,
+            timeoutMs: 12000,
             messages: makeMessages(false)
           }
         : {
             model: FAST_MODEL,
             effort: "low",
             maxTokens: 700,
-            temperature: 0.9,
+            temperature: 0.85,
             tools: undefined as any,
-            timeoutMs: 10000,
+            timeoutMs: 8000,
             messages: makeMessages(false)
           };
 
@@ -569,11 +742,11 @@ export default async function handler(req: any, res: any) {
       maxTokens: 900,
       temperature: 0.8,
       tools: undefined as any,
-      timeoutMs: 9000,
+      timeoutMs: 8000,
       messages: makeMessages(false)
     };
 
-    const plans = [planA, planSafe, planSafe];
+    const plans = [planA, planSafe];
 
     let answer = "";
     let lastStatus = 0;
@@ -589,7 +762,7 @@ export default async function handler(req: any, res: any) {
       } catch (e) {
         console.error("Groq attempt failed:", e);
       }
-      if (i < plans.length - 1) await sleep(350 * (i + 1));
+      if (i < plans.length - 1) await sleep(250);
     }
 
     if (!answer) {
@@ -631,6 +804,4 @@ export default async function handler(req: any, res: any) {
       text: fallback
     });
   }
-}
-
-  
+      }
