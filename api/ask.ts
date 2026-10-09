@@ -586,6 +586,128 @@ async function callGroq(
   return { ok: text.length > 0, status: r.status, text };
 }
 
+// ---------- streaming: send the answer sentence by sentence ----------
+
+async function streamPlan(
+  apiKey: string,
+  plan: any,
+  emit: (s: string) => void
+): Promise<{ status: number }> {
+  const r = await fetch(GROQ_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: plan.model,
+      messages: plan.messages,
+      temperature: plan.temperature,
+      max_tokens: plan.maxTokens,
+      reasoning_effort: plan.effort,
+      stream: true
+    }),
+    signal: AbortSignal.timeout(plan.timeoutMs)
+  });
+
+  if (!r.ok || !r.body) {
+    let errText = "";
+    try {
+      errText = (await r.text()).slice(0, 300);
+    } catch (e) {}
+    console.error("Groq stream error:", r.status, errText);
+    return { status: r.status };
+  }
+
+  const reader = (r.body as any).getReader();
+  const decoder = new TextDecoder();
+  let sseBuf = "";
+  let pending = "";
+  let carry = "";
+  let emitted = 0;
+  let finish = "";
+
+  const emitOne = (text: string) => {
+    const cleaned = stripFiller(cleanAnswer(text));
+    if (cleaned) {
+      emit(cleaned);
+      emitted++;
+    }
+  };
+
+  // Very short sentences are joined with the next one, so the voice is not choppy.
+  const pushSentence = (s: string, force: boolean) => {
+    carry = carry ? carry + " " + s : s;
+    const min = emitted === 0 ? 14 : 30;
+    if (carry.length >= min || force) {
+      emitOne(carry);
+      carry = "";
+    }
+  };
+
+  const takeSentence = (): string => {
+    const m = pending.match(/^([\s\S]*?[.!?]["')]?)\s+/);
+    if (!m) return "";
+    pending = pending.slice(m[0].length);
+    return m[1];
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      sseBuf += decoder.decode(value, { stream: true });
+
+      let nl: number;
+      while ((nl = sseBuf.indexOf("\n")) >= 0) {
+        const line = sseBuf.slice(0, nl).trim();
+        sseBuf = sseBuf.slice(nl + 1);
+
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+
+        let j: any = null;
+        try {
+          j = JSON.parse(data);
+        } catch (e) {
+          continue;
+        }
+
+        const choice = j?.choices?.[0];
+        if (choice?.finish_reason) finish = choice.finish_reason;
+
+        const piece = choice?.delta?.content;
+        if (typeof piece === "string" && piece) {
+          pending += piece;
+          let s = takeSentence();
+          while (s) {
+            pushSentence(s, false);
+            s = takeSentence();
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Stream read error:", e);
+  }
+
+  // the model ran out of space: drop the half-finished last sentence
+  if (finish === "length") pending = "";
+
+  const rest = pending.trim();
+  pending = "";
+  if (rest) {
+    pushSentence(rest, true);
+  } else if (carry) {
+    emitOne(carry);
+    carry = "";
+  }
+
+  return { status: r.status };
+}
+
 // ---------- the handler ----------
 
 export default async function handler(req: any, res: any) {
@@ -752,6 +874,63 @@ export default async function handler(req: any, res: any) {
 
     const plans = [planA, planSafe];
 
+    // The app asks for streaming with "stream": true. Web search stays normal.
+    const wantsStream = body.stream === true && !needsWeb;
+
+    if (wantsStream) {
+      const sentences: string[] = [];
+      let started = false;
+      let streamStatus = 0;
+
+      const emit = (s: string) => {
+        if (!started) {
+          started = true;
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+          res.setHeader("Cache-Control", "no-cache, no-transform");
+          res.setHeader("X-Accel-Buffering", "no");
+        }
+        sentences.push(s);
+        res.write(JSON.stringify({ s: s }) + "\n");
+      };
+
+      for (let i = 0; i < plans.length && sentences.length === 0; i++) {
+        try {
+          const r = await streamPlan(apiKey, plans[i], emit);
+          streamStatus = r.status;
+        } catch (e) {
+          console.error("Stream attempt failed:", e);
+        }
+        if (sentences.length === 0 && i < plans.length - 1) await sleep(250);
+      }
+
+      if (sentences.length > 0) {
+        // save memory AFTER the reply, so there is no waiting
+        const streamJob = saveMemory(sql, question, sentences.join(" "));
+        try {
+          waitUntil(streamJob);
+        } catch (e) {
+          streamJob.catch(() => {});
+        }
+
+        res.write(JSON.stringify({ done: true }) + "\n");
+        res.end();
+        return;
+      }
+
+      // nothing could be streamed: Jarvis still says something natural
+      const streamFallback =
+        streamStatus === 429
+          ? "Give me a second, sir. I'm a little overloaded right now. Ask me again in a moment?"
+          : "Sorry sir, my connection slipped for a second. Can you say that again?";
+
+      return res.status(200).json({
+        answer: streamFallback,
+        response: streamFallback,
+        text: streamFallback
+      });
+    }
+
     let answer = "";
     let lastStatus = 0;
 
@@ -808,4 +987,4 @@ export default async function handler(req: any, res: any) {
       text: fallback
     });
   }
-      }
+       }
