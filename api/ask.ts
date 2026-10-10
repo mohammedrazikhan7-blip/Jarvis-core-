@@ -593,7 +593,7 @@ async function streamPlan(
   apiKey: string,
   plan: any,
   emit: (s: string) => void
-): Promise<{ status: number }> {
+): Promise<{ status: number; broken?: boolean }> {
   const r = await fetch(GROQ_URL, {
     method: "POST",
     headers: {
@@ -627,7 +627,7 @@ async function streamPlan(
   let carry = "";
   let emitted = 0;
   let finish = "";
-
+  let broken = false;
   const emitOne = (text: string) => {
     const cleaned = stripFiller(cleanAnswer(text));
     if (cleaned) {
