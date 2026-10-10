@@ -693,7 +693,7 @@ async function streamPlan(
   } catch (e) {
     console.error("Stream read error:", e);
   }
-
+    broken = true;
   // the model ran out of space: drop the half-finished last sentence
   if (finish === "length") pending = "";
 
@@ -706,8 +706,7 @@ async function streamPlan(
     carry = "";
   }
 
-  return { status: r.status };
-}
+    return { status: r.status, broken };
 
 // ---------- the handler ----------
 
