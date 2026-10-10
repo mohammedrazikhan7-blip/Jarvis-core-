@@ -230,8 +230,8 @@ function looksLikeFact(q: string): boolean {
     /\b(friend|sister|brother|mother|mom|father|dad|girlfriend|cousin|uncle|aunt|teacher|boss|exam|birthday|college|job|gift|gifted|watch|bike|phone|name|named)\b/.test(
       t
     );
-  const iAm =
-    /\b(i am|i'm|i have|i like|i love|i hate|i study|i work|i live|i got|i bought|i play|i want to|i am going to)\b/.test(
+    const iAm =
+    /\b(i have|i like|i love|i hate|i study|i work|i live|i got|i bought|i play)\b/.test(
       t
     );
   return (mine && people) || iAm;
