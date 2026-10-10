@@ -163,7 +163,7 @@ function looksCutOff(q: string): boolean {
     .replace(/[\s.,!…-]+$/g, "")
     .trim();
   if (t.length > 220) return false;
-    const wc = t.split(/\s+/).length;
+  const wc = t.split(/\s+/).length;
   if (wc < 3 || wc > 14) return false;
   return CUTOFF_END_RE.test(t);
 }
@@ -231,7 +231,7 @@ function looksLikeFact(q: string): boolean {
     /\b(friend|sister|brother|mother|mom|father|dad|girlfriend|cousin|uncle|aunt|teacher|boss|exam|birthday|college|job|gift|gifted|watch|bike|phone|name|named)\b/.test(
       t
     );
-    const iAm =
+  const iAm =
     /\b(i have|i like|i love|i hate|i study|i work|i live|i got|i bought|i play)\b/.test(
       t
     );
@@ -628,6 +628,7 @@ async function streamPlan(
   let emitted = 0;
   let finish = "";
   let broken = false;
+
   const emitOne = (text: string) => {
     const cleaned = stripFiller(cleanAnswer(text));
     if (cleaned) {
@@ -692,8 +693,9 @@ async function streamPlan(
     }
   } catch (e) {
     console.error("Stream read error:", e);
-  }
     broken = true;
+  }
+
   // the model ran out of space: drop the half-finished last sentence
   if (finish === "length") pending = "";
 
@@ -706,7 +708,8 @@ async function streamPlan(
     carry = "";
   }
 
-    return { status: r.status, broken };
+  return { status: r.status, broken };
+}
 
 // ---------- the handler ----------
 
@@ -730,10 +733,13 @@ export default async function handler(req: any, res: any) {
       error: "Only POST requests are allowed"
     });
   }
+
+  // Password lock: only the Jarvis app (with the secret key) can ask.
   const appKey = process.env.JARVIS_APP_KEY;
   if (appKey && req.headers["x-jarvis-key"] !== appKey) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+
   try {
     const apiKey = process.env.GROQ_API_KEY;
 
@@ -756,6 +762,13 @@ export default async function handler(req: any, res: any) {
     if (!rawQuestion || typeof rawQuestion !== "string") {
       return res.status(400).json({
         error: "Question is required"
+      });
+    }
+
+    // Question length limit (protects your Groq quota)
+    if (rawQuestion.length > 2000) {
+      return res.status(400).json({
+        error: "Question is too long"
       });
     }
 
@@ -884,6 +897,7 @@ export default async function handler(req: any, res: any) {
       const sentences: string[] = [];
       let started = false;
       let streamStatus = 0;
+      let streamBroken = false;
 
       const emit = (s: string) => {
         if (!started) {
@@ -901,6 +915,7 @@ export default async function handler(req: any, res: any) {
         try {
           const r = await streamPlan(apiKey, plans[i], emit);
           streamStatus = r.status;
+          streamBroken = !!r.broken;
         } catch (e) {
           console.error("Stream attempt failed:", e);
         }
@@ -916,7 +931,7 @@ export default async function handler(req: any, res: any) {
           streamJob.catch(() => {});
         }
 
-        res.write(JSON.stringify({ done: true }) + "\n");
+        res.write(JSON.stringify({ done: true, broken: streamBroken }) + "\n");
         res.end();
         return;
       }
@@ -990,4 +1005,4 @@ export default async function handler(req: any, res: any) {
       text: fallback
     });
   }
-       }
+      }
