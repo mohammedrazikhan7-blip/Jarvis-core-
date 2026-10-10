@@ -730,7 +730,10 @@ export default async function handler(req: any, res: any) {
       error: "Only POST requests are allowed"
     });
   }
-
+  const appKey = process.env.JARVIS_APP_KEY;
+  if (appKey && req.headers["x-jarvis-key"] !== appKey) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   try {
     const apiKey = process.env.GROQ_API_KEY;
 
