@@ -163,7 +163,8 @@ function looksCutOff(q: string): boolean {
     .replace(/[\s.,!…-]+$/g, "")
     .trim();
   if (t.length > 220) return false;
-  if (t.split(/\s+/).length < 3) return false;
+    const wc = t.split(/\s+/).length;
+  if (wc < 3 || wc > 14) return false;
   return CUTOFF_END_RE.test(t);
 }
 
